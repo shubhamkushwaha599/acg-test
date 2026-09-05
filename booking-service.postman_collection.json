@@ -7,7 +7,8 @@
     { "key": "base_url", "value": "http://127.0.0.1:8000" },
     { "key": "token", "value": "" },
     { "key": "event_id", "value": "" },
-    { "key": "booking_id", "value": "" }
+    { "key": "booking_id", "value": "" },
+    { "key": "split_event_id", "value": "" }
   ],
   "item": [
     {
@@ -127,7 +128,7 @@
           }
         },
         {
-          "name": "Book Seats (over capacity -> waitlisted)",
+          "name": "Book Seats (over capacity -> one booking, status PARTIAL)",
           "request": {
             "method": "POST",
             "header": [
@@ -139,6 +140,62 @@
               "raw": "{\n  \"seats\": 5\n}"
             },
             "url": "{{base_url}}/events/{{event_id}}/book/"
+          }
+        },
+        {
+          "name": "Split Demo - Create Event (capacity 100)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.id) { pm.collectionVariables.set('split_event_id', body.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Split Demo Event\",\n  \"venue\": \"Main Hall\",\n  \"start_time\": \"2026-12-01T18:00:00Z\",\n  \"capacity\": 100\n}"
+            },
+            "url": "{{base_url}}/events/"
+          }
+        },
+        {
+          "name": "Split Demo - Book 98 (fills to 2 remaining)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 98\n}"
+            },
+            "url": "{{base_url}}/events/{{split_event_id}}/book/"
+          }
+        },
+        {
+          "name": "Split Demo - Book 4 (-> one booking, confirmed_seats=2, status=PARTIAL)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 4\n}"
+            },
+            "url": "{{base_url}}/events/{{split_event_id}}/book/"
           }
         },
         {

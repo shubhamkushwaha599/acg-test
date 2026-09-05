@@ -1,6 +1,7 @@
 from django.db import transaction
 from django.db.models import F
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -12,24 +13,48 @@ from .models import Booking
 from .serializers import BookingCreateSerializer, BookingSerializer
 
 
-def _promote_waitlist(event_id):
+def _grab_seats(event_id, count):
     """
-    FIFO promotion: walk waitlisted bookings oldest-first and promote each
-    one whose seat count now fits, stopping at the first one that doesn't
-    (so a later, smaller request can't jump ahead of an earlier, larger one).
-    Must be called from inside the same transaction as the seat-freeing
-    update so the capacity check below sees the freed seats.
+    Atomically grab up to `count` seats, one at a time, returning how many
+    were actually obtained. Each iteration is the same atomic conditional
+    decrement used everywhere in this service, so it carries the same
+    no-oversell guarantee under concurrency - this just repeats it to find
+    out exactly how many seats were available, up to `count`.
     """
-    for waitlisted in Booking.objects.filter(
-        event_id=event_id, status=Booking.WAITLISTED,
-    ).order_by('created_at'):
+    gained = 0
+    for _ in range(count):
         updated = Event.objects.filter(
-            id=event_id, seats_remaining__gte=waitlisted.seats,
-        ).update(seats_remaining=F('seats_remaining') - waitlisted.seats)
+            id=event_id, seats_remaining__gte=1,
+        ).update(seats_remaining=F('seats_remaining') - 1)
         if updated == 0:
             break
-        waitlisted.status = Booking.CONFIRMED
-        waitlisted.save(update_fields=['status'])
+        gained += 1
+    return gained
+
+
+def _promote_waitlist(event_id):
+    """
+    FIFO promotion: walk active bookings that still have a shortfall
+    (confirmed_seats < seats), oldest first, and grant each one as many of
+    its outstanding seats as are available. Stops as soon as one can't be
+    fully closed, so a later, smaller booking can't jump ahead of an
+    earlier, larger one - it can only benefit from capacity already left
+    over after the front of the queue takes what it can.
+    Must be called from inside the same transaction as the seat-freeing
+    update so the capacity check sees the freed seats.
+    """
+    candidates = Booking.objects.filter(
+        event_id=event_id, cancelled_at__isnull=True,
+    ).exclude(confirmed_seats=F('seats')).order_by('created_at')
+
+    for booking in candidates:
+        shortfall = booking.seats - booking.confirmed_seats
+        gained = _grab_seats(event_id, shortfall)
+        if gained:
+            booking.confirmed_seats += gained
+            booking.save(update_fields=['confirmed_seats'])
+        if gained < shortfall:
+            break
 
 
 class BookEventView(APIView):
@@ -43,21 +68,14 @@ class BookEventView(APIView):
         seats = input_serializer.validated_data['seats']
 
         with transaction.atomic():
-            updated = Event.objects.filter(
-                id=event_id, seats_remaining__gte=seats,
-            ).update(seats_remaining=F('seats_remaining') - seats)
-
-            if updated == 0:
-                booking = Booking.objects.create(
-                    event_id=event_id, user=request.user, seats=seats, status=Booking.WAITLISTED,
-                )
-                return Response(BookingSerializer(booking).data, status=status.HTTP_202_ACCEPTED)
-
+            confirmed_count = _grab_seats(event_id, seats)
             booking = Booking.objects.create(
-                event_id=event_id, user=request.user, seats=seats, status=Booking.CONFIRMED,
+                event_id=event_id, user=request.user, seats=seats,
+                confirmed_seats=confirmed_count,
             )
 
-        return Response(BookingSerializer(booking).data, status=status.HTTP_201_CREATED)
+        response_status = status.HTTP_201_CREATED if confirmed_count > 0 else status.HTTP_202_ACCEPTED
+        return Response(BookingSerializer(booking).data, status=response_status)
 
 
 class BookingListView(generics.ListAPIView):
@@ -80,23 +98,20 @@ class BookingCancelView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if booking.status == Booking.CANCELLED:
+        if booking.cancelled_at is not None:
             return Response(
                 {'detail': 'This booking is already cancelled.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         with transaction.atomic():
-            was_confirmed = booking.status == Booking.CONFIRMED
-            booking.status = Booking.CANCELLED
-            booking.save(update_fields=['status'])
+            freed = booking.confirmed_seats
+            booking.cancelled_at = timezone.now()
+            booking.save(update_fields=['cancelled_at'])
 
-            if was_confirmed:
-                # Only a CONFIRMED booking was actually holding seats; a
-                # WAITLISTED one never reserved capacity, so cancelling it
-                # frees nothing and shouldn't trigger promotion.
+            if freed > 0:
                 Event.objects.filter(id=booking.event_id).update(
-                    seats_remaining=F('seats_remaining') + booking.seats,
+                    seats_remaining=F('seats_remaining') + freed,
                 )
                 _promote_waitlist(booking.event_id)
 

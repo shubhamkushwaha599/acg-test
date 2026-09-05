@@ -59,13 +59,30 @@ class BookingFlowTests(APITestCase):
         response = self.client.post('/events/999999/book/', {'seats': 1})
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_book_more_than_available_is_waitlisted_cleanly(self):
+    def test_book_more_than_available_is_partially_confirmed_on_one_booking(self):
         self._auth()
         response = self.client.post(f'/events/{self.event.id}/book/', {'seats': 6})
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        self.assertEqual(response.data['status'], Booking.WAITLISTED)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['seats'], 6)
+        self.assertEqual(response.data['confirmed_seats'], 5)
+        self.assertEqual(response.data['status'], Booking.PARTIAL)
         self.event.refresh_from_db()
-        self.assertEqual(self.event.seats_remaining, 5)
+        self.assertEqual(self.event.seats_remaining, 0)
+        self.assertEqual(Booking.objects.filter(event=self.event).count(), 1)
+
+    def test_partial_booking_keeps_a_single_id_for_confirmed_and_waitlisted_seats(self):
+        event = make_event(capacity=100, seats_remaining=2)
+        self._auth()
+        response = self.client.post(f'/events/{event.id}/book/', {'seats': 4})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['seats'], 4)
+        self.assertEqual(response.data['confirmed_seats'], 2)
+        self.assertEqual(response.data['status'], Booking.PARTIAL)
+
+        event.refresh_from_db()
+        self.assertEqual(event.seats_remaining, 0)
+        self.assertEqual(Booking.objects.filter(event=event).count(), 1)
 
     def test_waitlisted_booking_promoted_on_cancel(self):
         self._auth(self.user)
@@ -85,7 +102,7 @@ class BookingFlowTests(APITestCase):
         self.event.refresh_from_db()
         self.assertEqual(self.event.seats_remaining, 3)
 
-    def test_waitlist_promotion_does_not_skip_ahead_in_fifo_order(self):
+    def test_waitlist_promotion_fills_front_of_queue_first_before_a_later_smaller_one(self):
         self._auth(self.user)
         booking_a = self.client.post(f'/events/{self.event.id}/book/', {'seats': 3}).data
         booking_b = self.client.post(f'/events/{self.event.id}/book/', {'seats': 2}).data
@@ -96,14 +113,20 @@ class BookingFlowTests(APITestCase):
         small_waitlisted = self.client.post(f'/events/{self.event.id}/book/', {'seats': 1}).data
 
         self._auth(self.user)
-        # Frees only 2 seats - not enough for the earlier 3-seat waitlisted
-        # request, even though it *would* be enough for the later 1-seat one.
+        # Frees only 2 seats - not enough to fully close the earlier 3-seat
+        # shortfall, but it still goes to the front of the queue first
+        # (2 of its 3 seats), rather than letting the later 1-seat request
+        # skip ahead just because it would fit exactly.
         self.client.post(f"/bookings/{booking_b['id']}/cancel/")
 
-        self.assertEqual(Booking.objects.get(id=big_waitlisted['id']).status, Booking.WAITLISTED)
-        self.assertEqual(Booking.objects.get(id=small_waitlisted['id']).status, Booking.WAITLISTED)
+        big = Booking.objects.get(id=big_waitlisted['id'])
+        small = Booking.objects.get(id=small_waitlisted['id'])
+        self.assertEqual(big.confirmed_seats, 2)
+        self.assertEqual(big.status, Booking.PARTIAL)
+        self.assertEqual(small.confirmed_seats, 0)
+        self.assertEqual(small.status, Booking.WAITLISTED)
         self.event.refresh_from_db()
-        self.assertEqual(self.event.seats_remaining, 2)
+        self.assertEqual(self.event.seats_remaining, 0)
 
     def test_cancelling_a_waitlisted_booking_frees_no_seats(self):
         self._auth(self.user)
@@ -202,8 +225,8 @@ class OverbookingConcurrencyTests(APITransactionTestCase):
         event.refresh_from_db()
         self.assertEqual(event.seats_remaining, 0)
         self.assertEqual(
-            Booking.objects.filter(event=event, status=Booking.CONFIRMED).count(), 3,
+            Booking.objects.filter(event=event, confirmed_seats=1).count(), 3,
         )
         self.assertEqual(
-            Booking.objects.filter(event=event, status=Booking.WAITLISTED).count(), 7,
+            Booking.objects.filter(event=event, confirmed_seats=0).count(), 7,
         )

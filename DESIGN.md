@@ -3,9 +3,10 @@
 ## Data model rationale
 
 `Event` (`name`, `venue`, `start_time`, `capacity`) lives in its own `events` app; `Booking`
-(`event` FK, `user` FK, `seats`, `status`, `created_at`) lives in a separate `bookings` app that
-depends on `events`. Splitting them keeps each app's responsibility narrow and mirrors how the
-URLs are already partitioned in the spec (`/events/...` vs `/bookings/...`).
+(`event` FK, `user` FK, `seats`, `confirmed_seats`, `cancelled_at`, `created_at`) lives in a
+separate `bookings` app that depends on `events`. Splitting them keeps each app's responsibility
+narrow and mirrors how the URLs are already partitioned in the spec (`/events/...` vs
+`/bookings/...`).
 
 `Event` carries a **denormalized `seats_remaining`** column alongside the immutable `capacity`,
 rather than computing remaining seats on the fly by summing active `Booking.seats`. This is the
@@ -15,7 +16,23 @@ needs its own locking/isolation reasoning. The cost is a second source of truth 
 in sync with `Booking` rows — mitigated by only ever mutating it inside the same
 `transaction.atomic()` block that creates/cancels the booking, so the two are always consistent.
 
-`Booking.status` is `CONFIRMED`/`CANCELLED` (no soft-delete) so cancelled bookings stay auditable.
+`Booking.status` (`CONFIRMED`/`PARTIAL`/`WAITLISTED`/`CANCELLED`) is **not a stored column** — it's
+a read-only Python property derived from `seats`, `confirmed_seats`, and `cancelled_at`:
+```python
+@property
+def status(self):
+    if self.cancelled_at is not None:
+        return 'CANCELLED'
+    if self.confirmed_seats == 0:
+        return 'WAITLISTED'
+    if self.confirmed_seats == self.seats:
+        return 'CONFIRMED'
+    return 'PARTIAL'
+```
+Storing it as a separate enum column would just be a second source of truth to keep in sync every
+time `confirmed_seats` changes (at booking time, at promotion time); deriving it removes that
+entirely. `cancelled_at` is a nullable timestamp rather than a boolean/enum value so cancelled
+bookings stay auditable (when, not just whether) without a soft-delete.
 
 ## How overselling is prevented
 
@@ -24,15 +41,11 @@ has a race window between the read and the write. Instead, inside `transaction.a
 
 ```python
 updated = Event.objects.filter(
-    id=event_id, seats_remaining__gte=seats,
-).update(seats_remaining=F('seats_remaining') - seats)
-
-if updated == 0:
-    return 409  # someone else got there first, or event doesn't exist
-Booking.objects.create(event_id=event_id, user=request.user, seats=seats, status='CONFIRMED')
+    id=event_id, seats_remaining__gte=1,
+).update(seats_remaining=F('seats_remaining') - 1)
 ```
 
-The `WHERE seats_remaining >= N` and the decrement happen as **one SQL statement**, so the
+The `WHERE seats_remaining >= 1` and the decrement happen as **one SQL statement**, so the
 check-and-reserve is atomic regardless of how many requests arrive at the same instant:
 
 - **On MySQL/InnoDB**, the `UPDATE` takes a row lock on the matching `Event` row for the
@@ -46,10 +59,44 @@ check-and-reserve is atomic regardless of how many requests arrive at the same i
   guarantee holds for the identical reason (one atomic statement, no read/write gap) even though
   the underlying locking granularity is coarser.
 
-Cancellation mirrors this: mark the booking `CANCELLED`, then `F('seats_remaining') + seats`,
-both in one transaction. `select_for_update()` was deliberately **not** used — Django's support
-for it on SQLite is unsupported, and the conditional-`UPDATE` pattern above needed no explicit
-locking on either backend, so it also means the exact same code path is what gets tested.
+**Partial fulfillment, one `Booking` row per request:** a request for more seats than remain
+doesn't waitlist the *whole* request, and doesn't fragment it into separate rows either — it
+confirms as many seats as are available and records the shortfall on the *same* booking (e.g. 2
+seats left, someone requests 4 → one `Booking` with `seats=4, confirmed_seats=2`, `status`
+`"PARTIAL"`). This is done by calling the single-seat conditional decrement above up to `seats`
+times inside one transaction (helper `_grab_seats`), counting how many succeed before the first
+failure:
+```python
+def _grab_seats(event_id, count):
+    gained = 0
+    for _ in range(count):
+        updated = Event.objects.filter(id=event_id, seats_remaining__gte=1).update(
+            seats_remaining=F('seats_remaining') - 1)
+        if updated == 0:
+            break
+        gained += 1
+    return gained
+
+confirmed_count = _grab_seats(event_id, seats)
+booking = Booking.objects.create(
+    event_id=event_id, user=request.user, seats=seats, confirmed_seats=confirmed_count)
+```
+A single bulk `UPDATE ... SET seats_remaining = seats_remaining - LEAST(seats_remaining, N)` would
+be more efficient (one statement instead of up to N), but it doesn't tell Python how many seats
+were actually granted — and there's no portable, race-free way to also read that count without
+either `select_for_update()` (unsupported on SQLite) or a plain read that could go stale against a
+concurrent transaction. Repeating the already-proven atomic primitive keeps the exact same
+correctness argument instead of introducing a new one, at the cost of O(seats) statements — an
+acceptable trade-off given booking requests are realistically single/low-double-digit seat counts.
+The response is always a single booking object: `201` if `confirmed_count > 0` (fully or
+partially granted), `202` if `confirmed_count == 0` (fully waitlisted).
+
+Cancellation mirrors this: record `freed = booking.confirmed_seats`, set `cancelled_at = now()`,
+then `F('seats_remaining') + freed`, all in one transaction, followed by waitlist promotion (see
+below) if anything was actually freed. `select_for_update()` was deliberately **not** used —
+Django's support for it on SQLite is unsupported, and the conditional-`UPDATE` pattern above
+needed no explicit locking on either backend, so it also means the exact same code path is what
+gets tested.
 
 **Proof, not just an argument:** `bookings/tests.py::OverbookingConcurrencyTests` creates an
 event with 3 seats left, fires 10 concurrent `book` requests for 1 seat each from separate
@@ -75,18 +122,21 @@ threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are c
 - **No separate "organizer" role.** Any authenticated user can create events (`IsAuthenticated`
   on `POST /events`); reads are public (`IsAuthenticatedOrReadOnly`). A real product would likely
   gate event creation behind a staff/organizer permission.
-- **Waitlist (stretch goal, implemented).** When a booking request can't fit
-  (`seats_remaining < requested`), instead of a flat rejection the request is stored as a
-  `WAITLISTED` booking (`202 Accepted`) rather than rejected outright. This intentionally
-  supersedes plain "reject cleanly if capacity is insufficient" for the fully-booked case, per the
-  stretch goal's description of the desired behavior — a request only gets a hard `409` when the
-  event doesn't exist or seats are invalid, never merely for being full. On cancellation of a
-  `CONFIRMED` booking, `_promote_waitlist()` walks `WAITLISTED` bookings for that event oldest
-  first and promotes each whose seat count fits in the freed capacity, using the exact same
-  atomic conditional-`UPDATE` as a normal booking (so promotion is subject to the same no-oversell
-  guarantee). Promotion **stops** at the first waitlisted request that doesn't fit rather than
-  skipping ahead to a smaller, later one — strict FIFO over utilization. Cancelling a `WAITLISTED`
-  booking (leaving the queue) frees no seats and doesn't trigger promotion, since it never held any.
+- **Waitlist (stretch goal, implemented).** When a booking request can't be fully satisfied
+  (`seats_remaining < requested`), instead of a flat rejection it's partially or fully waitlisted
+  on the *same* `Booking` row (`202 Accepted` if nothing was confirmed, `201 Created` if at least
+  one seat was — see "Partial fulfillment" above). This intentionally supersedes plain "reject
+  cleanly if capacity is insufficient" for the fully/partially-booked case, per the stretch goal's
+  description of the desired behavior — a request only gets a hard `409`/`400` for an unknown
+  event or invalid seat count, never merely for being full. On cancellation of a booking that held
+  seats, `_promote_waitlist()` walks other active bookings for that event that still have a
+  shortfall (`confirmed_seats < seats`), oldest first, and grants each as many of its outstanding
+  seats as are available, using the exact same atomic conditional decrement as a normal booking (so
+  promotion is subject to the same no-oversell guarantee). It **stops** as soon as one can't be
+  fully closed — the oldest booking with a shortfall gets first claim on whatever capacity exists,
+  even if that only partially fills it, and a later, smaller booking can never jump the queue ahead
+  of it. Cancelling a fully-`WAITLISTED` booking (`confirmed_seats == 0`) frees no seats and
+  doesn't trigger promotion, since it never held any.
 
 ## Scaling
 
