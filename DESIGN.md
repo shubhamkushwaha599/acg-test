@@ -123,13 +123,6 @@ threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are c
 
 ## Trade-offs
 
-- **`Booking.seats` tracks the *currently active* total, not the original request.** Supporting
-  partial cancellation by shrinking `seats` directly (rather than adding a separate
-  `original_seats`/`cancelled_seats` pair) keeps the model to three mutable counters instead of
-  four. The cost: once seats are partially cancelled, the API response no longer shows how many
-  were requested originally — only what's still active. Acceptable here since nothing else in the
-  service needs that historical number; a real audit trail would want a separate immutable field
-  or an append-only ledger of booking events instead.
 - **SQLite instead of MySQL.** The task's fallback clause was used: Python 3.14 is very new and
   `mysqlclient` had no prebuilt Windows wheel available, which risked a lengthy C-build detour
   inside the 2h budget. Concurrency-wise, this trades MySQL's per-row InnoDB locking (many events
@@ -137,7 +130,14 @@ threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are c
   writer-at-a-time database lock (booking on *any* event blocks booking on *every other* event
   for the duration of that one `UPDATE`). Correctness — no overselling — holds on both; only
   concurrent *throughput* differs. The models/queries have no SQLite-specific code, so switching
-  `DATABASES` to MySQL is a config change, not a rewrite.
+  `DATABASES` to MySQL is a config change, not a rewrite (see README for what else that involves).
+- **`Booking.seats` tracks the *currently active* total, not the original request.** Supporting
+  partial cancellation by shrinking `seats` directly (rather than adding a separate
+  `original_seats`/`cancelled_seats` pair) keeps the model to three mutable counters instead of
+  four. The cost: once seats are partially cancelled, the API response no longer shows how many
+  were requested originally — only what's still active. Acceptable here since nothing else in the
+  service needs that historical number; a real audit trail would want a separate immutable field
+  or an append-only ledger of booking events instead.
 - **No `django-filter` dependency.** The event list only needed two date-range params and one
   boolean flag, so this was implemented as plain `get_queryset()` filtering to keep the dependency
   surface small.
@@ -179,16 +179,29 @@ threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are c
 
 ## AI usage note
 
-This service was built with AI assistance (Claude, via Claude Code) for scaffolding boilerplate
-(model/serializer/view/url wiring) and for drafting the concurrency test's threading harness. I
-verified the concurrency claim empirically rather than trusting it by inspection: I ran
-`OverbookingConcurrencyTests` repeatedly, confirmed the exact 3-succeed/7-reject split and the
-final `seats_remaining == 0` invariant, and manually exercised the full flow end-to-end with
-`curl` against a running dev server (create event → book → over-book rejected with 409 → list own
-bookings → cancel → seats restored) before treating any of it as done. The one thing I had to
-actually debug rather than accept as-is: the first version of the concurrency test failed with
-sqlite3 `"database table is locked"` under Django's default in-memory shared-cache test database,
-because `SQLITE_LOCKED` (shared-cache table lock) isn't retried by the busy-timeout the way
-`SQLITE_BUSY` is — fixed by pointing the test database at a real file
-(`DATABASES['default']['TEST']['NAME']`) so threads get OS-level file locking with proper
-busy-timeout retries instead.
+This service was built with AI assistance (Claude, via Claude Code) end to end: scaffolding the
+two Django apps, the model/serializer/view/url wiring, the concurrency test's threading harness,
+and iterating the booking/cancellation logic through three revisions (reject-on-full → waitlist
+with two rows per split booking → the current single-row `confirmed_seats` model with partial
+cancellation) as requirements were refined in conversation.
+
+I didn't accept any of the concurrency or correctness claims by inspection — each was verified by
+actually running it:
+- `OverbookingConcurrencyTests` was run repeatedly and its exact 3-succeed/7-waitlisted split and
+  final `seats_remaining == 0` invariant confirmed on each revision of the booking logic, not just
+  the first one.
+- Every behavior change (partial fulfillment, single-row split, waitlist promotion partially
+  filling the front of the queue, partial cancellation preferring the waitlisted portion first)
+  was exercised live against a running dev server with `curl`/Postman and the actual response
+  bodies inspected, not assumed — e.g. confirming a booking's `id` stays the same across a
+  `PARTIAL → CONFIRMED` promotion after a later cancellation, not just that the numbers add up.
+- One real bug surfaced and was fixed rather than worked around: the first version of the
+  concurrency test failed with sqlite3 `"database table is locked"` under Django's default
+  in-memory shared-cache test database, because `SQLITE_LOCKED` (shared-cache table lock) isn't
+  retried by the busy-timeout the way `SQLITE_BUSY` is — fixed by pointing the test database at a
+  real file (`DATABASES['default']['TEST']['NAME']`) so threads get OS-level file locking with
+  proper busy-timeout retries instead.
+- One operational mistake was mine, not the code's: I deleted the local dev `db.sqlite3` as
+  cleanup after a manual test while the user still had a server/Postman session pointed at it,
+  which surfaced as `no such table` errors for them — fixed by re-running `migrate`, and I stopped
+  deleting that file once it was clear it was in active use.
