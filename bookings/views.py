@@ -10,7 +10,7 @@ from rest_framework.views import APIView
 from events.models import Event
 
 from .models import Booking
-from .serializers import BookingCreateSerializer, BookingSerializer
+from .serializers import BookingCancelSerializer, BookingCreateSerializer, BookingSerializer
 
 
 def _grab_seats(event_id, count):
@@ -104,14 +104,35 @@ class BookingCancelView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        with transaction.atomic():
-            freed = booking.confirmed_seats
-            booking.cancelled_at = timezone.now()
-            booking.save(update_fields=['cancelled_at'])
+        input_serializer = BookingCancelSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        cancel_seats = input_serializer.validated_data.get('seats', booking.seats)
 
-            if freed > 0:
+        if cancel_seats > booking.seats:
+            return Response(
+                {'detail': f'This booking only holds {booking.seats} seat(s), cannot cancel {cancel_seats}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            # Give up the still-waitlisted portion of the request first (it
+            # isn't holding any real capacity yet), and only dip into the
+            # confirmed portion once the waitlisted shortfall is exhausted.
+            # Cancelling exactly a booking's shortfall turns a PARTIAL
+            # booking into a clean CONFIRMED one for what's left.
+            shortfall = booking.seats - booking.confirmed_seats
+            from_waitlisted = min(cancel_seats, shortfall)
+            from_confirmed = cancel_seats - from_waitlisted
+
+            booking.seats -= cancel_seats
+            booking.confirmed_seats -= from_confirmed
+            if booking.seats == 0:
+                booking.cancelled_at = timezone.now()
+            booking.save(update_fields=['seats', 'confirmed_seats', 'cancelled_at'])
+
+            if from_confirmed > 0:
                 Event.objects.filter(id=booking.event_id).update(
-                    seats_remaining=F('seats_remaining') + freed,
+                    seats_remaining=F('seats_remaining') + from_confirmed,
                 )
                 _promote_waitlist(booking.event_id)
 

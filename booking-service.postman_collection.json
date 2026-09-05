@@ -249,7 +249,7 @@
           }
         },
         {
-          "name": "Cancel Booking",
+          "name": "Cancel Booking (full - no body)",
           "request": {
             "method": "POST",
             "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
@@ -261,6 +261,36 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/bookings/{{booking_id}}/cancel/"
+          }
+        },
+        {
+          "name": "Cancel Booking (partial - pass seats in body)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 1\n}"
+            },
+            "url": "{{base_url}}/bookings/{{booking_id}}/cancel/"
+          }
+        },
+        {
+          "name": "Cancel Booking (more seats than it holds -> 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 999\n}"
+            },
             "url": "{{base_url}}/bookings/{{booking_id}}/cancel/"
           }
         }

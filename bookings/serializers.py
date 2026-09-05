@@ -12,3 +12,7 @@ class BookingSerializer(serializers.ModelSerializer):
 
 class BookingCreateSerializer(serializers.Serializer):
     seats = serializers.IntegerField(min_value=1)
+
+
+class BookingCancelSerializer(serializers.Serializer):
+    seats = serializers.IntegerField(min_value=1, required=False)

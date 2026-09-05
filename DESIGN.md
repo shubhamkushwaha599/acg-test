@@ -91,12 +91,29 @@ acceptable trade-off given booking requests are realistically single/low-double-
 The response is always a single booking object: `201` if `confirmed_count > 0` (fully or
 partially granted), `202` if `confirmed_count == 0` (fully waitlisted).
 
-Cancellation mirrors this: record `freed = booking.confirmed_seats`, set `cancelled_at = now()`,
-then `F('seats_remaining') + freed`, all in one transaction, followed by waitlist promotion (see
-below) if anything was actually freed. `select_for_update()` was deliberately **not** used —
-Django's support for it on SQLite is unsupported, and the conditional-`UPDATE` pattern above
-needed no explicit locking on either backend, so it also means the exact same code path is what
-gets tested.
+Cancellation mirrors this, and also supports **partial** cancellation: `POST
+/bookings/{id}/cancel/` takes an optional `{"seats": N}` (defaults to the booking's full current
+`seats` if omitted, i.e. cancel everything — the original all-or-nothing behavior). The seats
+being given up are taken from the booking's still-*waitlisted* portion first (it isn't holding any
+real capacity yet), and only dip into the *confirmed* portion once that shortfall is exhausted:
+```python
+shortfall = booking.seats - booking.confirmed_seats
+from_waitlisted = min(cancel_seats, shortfall)
+from_confirmed = cancel_seats - from_waitlisted
+booking.seats -= cancel_seats
+booking.confirmed_seats -= from_confirmed
+if booking.seats == 0:
+    booking.cancelled_at = timezone.now()
+```
+Only `from_confirmed` (real capacity actually given back) triggers `F('seats_remaining') +
+from_confirmed` and waitlist promotion — cancelling only the waitlisted overflow of a `PARTIAL`
+booking frees nothing, it just turns that booking into a clean `CONFIRMED` one for what's left.
+`cancelled_at` is only set once the booking's `seats` reaches zero (fully given up); a booking
+that's been partially cancelled stays active with a smaller `seats`/`confirmed_seats`. Requesting
+to cancel more seats than the booking currently holds is rejected with `400`. `select_for_update()`
+was deliberately **not** used anywhere in this service — Django's support for it on SQLite is
+unsupported, and the conditional-`UPDATE` pattern above needed no explicit locking on either
+backend, so it also means the exact same code path is what gets tested.
 
 **Proof, not just an argument:** `bookings/tests.py::OverbookingConcurrencyTests` creates an
 event with 3 seats left, fires 10 concurrent `book` requests for 1 seat each from separate
@@ -106,6 +123,13 @@ threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are c
 
 ## Trade-offs
 
+- **`Booking.seats` tracks the *currently active* total, not the original request.** Supporting
+  partial cancellation by shrinking `seats` directly (rather than adding a separate
+  `original_seats`/`cancelled_seats` pair) keeps the model to three mutable counters instead of
+  four. The cost: once seats are partially cancelled, the API response no longer shows how many
+  were requested originally — only what's still active. Acceptable here since nothing else in the
+  service needs that historical number; a real audit trail would want a separate immutable field
+  or an append-only ledger of booking events instead.
 - **SQLite instead of MySQL.** The task's fallback clause was used: Python 3.14 is very new and
   `mysqlclient` had no prebuilt Windows wheel available, which risked a lengthy C-build detour
   inside the 2h budget. Concurrency-wise, this trades MySQL's per-row InnoDB locking (many events

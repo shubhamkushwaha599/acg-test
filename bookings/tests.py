@@ -170,6 +170,63 @@ class BookingFlowTests(APITestCase):
         response = self.client.post(f'/bookings/{booking_id}/cancel/')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_partial_cancel_reduces_seats_and_frees_only_those_seats(self):
+        self._auth()
+        booking_id = self.client.post(f'/events/{self.event.id}/book/', {'seats': 3}).data['id']
+
+        response = self.client.post(f'/bookings/{booking_id}/cancel/', {'seats': 1})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['seats'], 2)
+        self.assertEqual(response.data['confirmed_seats'], 2)
+        self.assertEqual(response.data['status'], Booking.CONFIRMED)
+
+        booking = Booking.objects.get(id=booking_id)
+        self.assertIsNone(booking.cancelled_at)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.seats_remaining, 3)
+
+    def test_partial_cancel_gives_up_waitlisted_portion_before_confirmed(self):
+        self._auth()
+        # Event has 5 seats; requesting 6 gives 5 CONFIRMED + 1 WAITLISTED (PARTIAL).
+        booking_id = self.client.post(f'/events/{self.event.id}/book/', {'seats': 6}).data['id']
+
+        response = self.client.post(f'/bookings/{booking_id}/cancel/', {'seats': 1})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['seats'], 5)
+        self.assertEqual(response.data['confirmed_seats'], 5)
+        self.assertEqual(response.data['status'], Booking.CONFIRMED)
+
+        # Only the waitlisted seat was given up - nothing real was freed.
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.seats_remaining, 0)
+
+    def test_partial_cancel_dips_into_confirmed_seats_after_waitlist_exhausted(self):
+        self._auth(self.user)
+        # 5 seats; requesting 6 gives 5 CONFIRMED + 1 WAITLISTED (PARTIAL).
+        booking_id = self.client.post(f'/events/{self.event.id}/book/', {'seats': 6}).data['id']
+
+        response = self.client.post(f'/bookings/{booking_id}/cancel/', {'seats': 3})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['seats'], 3)
+        # 1 seat came from the waitlisted portion, 2 from the confirmed portion.
+        self.assertEqual(response.data['confirmed_seats'], 3)
+        self.assertEqual(response.data['status'], Booking.CONFIRMED)
+
+        # The 2 confirmed seats given up are real capacity - they come back.
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.seats_remaining, 2)
+
+    def test_cancel_more_seats_than_booking_holds_rejected(self):
+        self._auth()
+        booking_id = self.client.post(f'/events/{self.event.id}/book/', {'seats': 2}).data['id']
+
+        response = self.client.post(f'/bookings/{booking_id}/cancel/', {'seats': 5})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        booking = Booking.objects.get(id=booking_id)
+        self.assertEqual(booking.seats, 2)
+        self.assertIsNone(booking.cancelled_at)
+
     def test_list_bookings_only_returns_own(self):
         self._auth(self.user)
         self.client.post(f'/events/{self.event.id}/book/', {'seats': 1})
