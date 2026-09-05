@@ -1,0 +1,213 @@
+{
+  "info": {
+    "name": "Booking Service",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8000" },
+    { "key": "token", "value": "" },
+    { "key": "event_id", "value": "" },
+    { "key": "booking_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Get Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access) { pm.collectionVariables.set('token', body.access); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"demo\",\n  \"password\": \"demopass123\"\n}"
+            },
+            "url": "{{base_url}}/api/token/"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Events",
+      "item": [
+        {
+          "name": "Create Event",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.id) { pm.collectionVariables.set('event_id', body.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Concert\",\n  \"venue\": \"Main Hall\",\n  \"start_time\": \"2026-12-01T18:00:00Z\",\n  \"capacity\": 3\n}"
+            },
+            "url": "{{base_url}}/events/"
+          }
+        },
+        {
+          "name": "List Events",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/events/"
+          }
+        },
+        {
+          "name": "List Events - Available Only",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/events/?available=true"
+          }
+        },
+        {
+          "name": "List Events - Date Range",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/events/?start_after=2026-01-01T00:00:00Z&start_before=2027-01-01T00:00:00Z"
+          }
+        },
+        {
+          "name": "Event Detail",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/events/{{event_id}}/"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Bookings",
+      "item": [
+        {
+          "name": "Book Seats (success)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.id) { pm.collectionVariables.set('booking_id', body.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 2\n}"
+            },
+            "url": "{{base_url}}/events/{{event_id}}/book/"
+          }
+        },
+        {
+          "name": "Book Seats (over capacity -> waitlisted)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 5\n}"
+            },
+            "url": "{{base_url}}/events/{{event_id}}/book/"
+          }
+        },
+        {
+          "name": "Book Seats (invalid seats -> 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 0\n}"
+            },
+            "url": "{{base_url}}/events/{{event_id}}/book/"
+          }
+        },
+        {
+          "name": "Book Seats (no auth -> 401)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 1\n}"
+            },
+            "url": "{{base_url}}/events/{{event_id}}/book/"
+          }
+        },
+        {
+          "name": "Book Seats (unknown event -> 404)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": 1\n}"
+            },
+            "url": "{{base_url}}/events/999999/book/"
+          }
+        },
+        {
+          "name": "List My Bookings",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/bookings/"
+          }
+        },
+        {
+          "name": "Cancel Booking",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/bookings/{{booking_id}}/cancel/"
+          }
+        },
+        {
+          "name": "Cancel Booking Again (-> 400 already cancelled)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/bookings/{{booking_id}}/cancel/"
+          }
+        }
+      ]
+    }
+  ]
+}
