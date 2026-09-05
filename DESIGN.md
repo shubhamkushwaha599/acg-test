@@ -4,204 +4,102 @@
 
 `Event` (`name`, `venue`, `start_time`, `capacity`) lives in its own `events` app; `Booking`
 (`event` FK, `user` FK, `seats`, `confirmed_seats`, `cancelled_at`, `created_at`) lives in a
-separate `bookings` app that depends on `events`. Splitting them keeps each app's responsibility
-narrow and mirrors how the URLs are already partitioned in the spec (`/events/...` vs
+separate `bookings` app that depends on it — mirrors the URL split in the spec (`/events/...` vs
 `/bookings/...`).
 
-`Event` carries a **denormalized `seats_remaining`** column alongside the immutable `capacity`,
-rather than computing remaining seats on the fly by summing active `Booking.seats`. This is the
-one non-obvious modelling choice, and it is deliberate: it turns "check capacity and reserve
-seats" into a single atomic conditional `UPDATE` (below) instead of a read-then-write pair that
-needs its own locking/isolation reasoning. The cost is a second source of truth that must be kept
-in sync with `Booking` rows — mitigated by only ever mutating it inside the same
-`transaction.atomic()` block that creates/cancels the booking, so the two are always consistent.
+`Event` carries a **denormalized `seats_remaining`** alongside the immutable `capacity`, rather
+than computing remaining seats by summing active bookings. This is the key modelling choice: it
+turns "check capacity and reserve" into a single atomic conditional `UPDATE` (below) instead of a
+read-then-write pair with its own locking/isolation reasoning. The cost — a second source of
+truth — is mitigated by only ever mutating it inside the same `transaction.atomic()` block that
+creates/cancels the booking.
 
-`Booking.status` (`CONFIRMED`/`PARTIAL`/`WAITLISTED`/`CANCELLED`) is **not a stored column** — it's
-a read-only Python property derived from `seats`, `confirmed_seats`, and `cancelled_at`:
+`Booking.status` (`CONFIRMED`/`PARTIAL`/`WAITLISTED`/`CANCELLED`) is a derived property, not a
+stored column, so it can never drift from the two counters it's computed from:
 ```python
 @property
 def status(self):
-    if self.cancelled_at is not None:
-        return 'CANCELLED'
-    if self.confirmed_seats == 0:
-        return 'WAITLISTED'
-    if self.confirmed_seats == self.seats:
-        return 'CONFIRMED'
+    if self.cancelled_at is not None: return 'CANCELLED'
+    if self.confirmed_seats == 0: return 'WAITLISTED'
+    if self.confirmed_seats == self.seats: return 'CONFIRMED'
     return 'PARTIAL'
 ```
-Storing it as a separate enum column would just be a second source of truth to keep in sync every
-time `confirmed_seats` changes (at booking time, at promotion time); deriving it removes that
-entirely. `cancelled_at` is a nullable timestamp rather than a boolean/enum value so cancelled
-bookings stay auditable (when, not just whether) without a soft-delete.
 
 ## How overselling is prevented
 
-The booking view does not read `seats_remaining`, check it in Python, then write — that pattern
-has a race window between the read and the write. Instead, inside `transaction.atomic()`:
+The booking view never reads `seats_remaining`, checks it in Python, then writes — that has a
+race window between read and write. Instead, every seat is claimed with one atomic statement:
 
 ```python
-updated = Event.objects.filter(
-    id=event_id, seats_remaining__gte=1,
-).update(seats_remaining=F('seats_remaining') - 1)
+updated = Event.objects.filter(id=event_id, seats_remaining__gte=1) \
+                        .update(seats_remaining=F('seats_remaining') - 1)
 ```
 
-The `WHERE seats_remaining >= 1` and the decrement happen as **one SQL statement**, so the
-check-and-reserve is atomic regardless of how many requests arrive at the same instant:
+The `WHERE` and the decrement happen as **one SQL statement**, so the check-and-reserve can't be
+interleaved by a concurrent request: on **MySQL/InnoDB** the `UPDATE` row-locks the matching
+`Event` for its duration, so two requests racing for the last seat serialize on that row (per-row,
+so different events never contend); on **SQLite** (what this submission runs) there's no
+row-level lock, but SQLite serializes *all* writers on one database-level lock, so the same
+single-statement `UPDATE` still can't interleave — safe for the same reason, just not concurrent
+across events.
 
-- **On MySQL/InnoDB**, the `UPDATE` takes a row lock on the matching `Event` row for the
-  statement's duration. Two concurrent transactions racing for the last seat serialize on that
-  row: whichever commits first wins, the second re-evaluates the `WHERE` against the now-updated
-  value and legitimately finds `updated == 0` if seats ran out. Different events don't contend
-  with each other at all — the lock is per-row, not table- or DB-wide.
-- **On SQLite** (what this submission actually runs — see trade-offs below), there is no
-  row-level locking, but SQLite serializes all writers on a single database-level lock, so the
-  same single-statement `UPDATE` still can't interleave with another writer's `UPDATE`. The
-  guarantee holds for the identical reason (one atomic statement, no read/write gap) even though
-  the underlying locking granularity is coarser.
+**Partial fulfillment** is built on the exact same primitive, repeated: a helper (`_grab_seats`)
+calls that one-seat decrement in a loop, up to the number requested, and stops at the first
+failure — so a request for more seats than remain confirms as many as are available and records
+the rest as a shortfall on the *same* `Booking` row (`seats=4, confirmed_seats=2`,
+`status="PARTIAL"`) rather than rejecting outright or creating a second row. **Cancellation**
+mirrors this in reverse, and supports partial cancellation too (`{"seats": N}`, optional): it gives
+up a booking's still-waitlisted seats first (they hold no real capacity) before dipping into
+confirmed ones, only freeing `seats_remaining` (and running waitlist promotion) for whatever was
+actually confirmed. Promotion (`_promote_waitlist`) walks other bookings with a shortfall, oldest
+first, granting each as much of the freed capacity as it can via the same primitive, and stops as
+soon as one can't be fully closed — so a later, smaller request can never jump the queue.
 
-**Partial fulfillment, one `Booking` row per request:** a request for more seats than remain
-doesn't waitlist the *whole* request, and doesn't fragment it into separate rows either — it
-confirms as many seats as are available and records the shortfall on the *same* booking (e.g. 2
-seats left, someone requests 4 → one `Booking` with `seats=4, confirmed_seats=2`, `status`
-`"PARTIAL"`). This is done by calling the single-seat conditional decrement above up to `seats`
-times inside one transaction (helper `_grab_seats`), counting how many succeed before the first
-failure:
-```python
-def _grab_seats(event_id, count):
-    gained = 0
-    for _ in range(count):
-        updated = Event.objects.filter(id=event_id, seats_remaining__gte=1).update(
-            seats_remaining=F('seats_remaining') - 1)
-        if updated == 0:
-            break
-        gained += 1
-    return gained
+A bulk `UPDATE ... - LEAST(seats_remaining, N)` would be more efficient than the per-seat loop,
+but can't portably tell Python how many seats it actually granted without an extra locked read
+(`select_for_update()`, unsupported on SQLite). Repeating the proven primitive keeps one
+correctness argument instead of two, at the cost of O(seats) statements — acceptable given
+realistic booking sizes.
 
-confirmed_count = _grab_seats(event_id, seats)
-booking = Booking.objects.create(
-    event_id=event_id, user=request.user, seats=seats, confirmed_seats=confirmed_count)
-```
-A single bulk `UPDATE ... SET seats_remaining = seats_remaining - LEAST(seats_remaining, N)` would
-be more efficient (one statement instead of up to N), but it doesn't tell Python how many seats
-were actually granted — and there's no portable, race-free way to also read that count without
-either `select_for_update()` (unsupported on SQLite) or a plain read that could go stale against a
-concurrent transaction. Repeating the already-proven atomic primitive keeps the exact same
-correctness argument instead of introducing a new one, at the cost of O(seats) statements — an
-acceptable trade-off given booking requests are realistically single/low-double-digit seat counts.
-The response is always a single booking object: `201` if `confirmed_count > 0` (fully or
-partially granted), `202` if `confirmed_count == 0` (fully waitlisted).
-
-Cancellation mirrors this, and also supports **partial** cancellation: `POST
-/bookings/{id}/cancel/` takes an optional `{"seats": N}` (defaults to the booking's full current
-`seats` if omitted, i.e. cancel everything — the original all-or-nothing behavior). The seats
-being given up are taken from the booking's still-*waitlisted* portion first (it isn't holding any
-real capacity yet), and only dip into the *confirmed* portion once that shortfall is exhausted:
-```python
-shortfall = booking.seats - booking.confirmed_seats
-from_waitlisted = min(cancel_seats, shortfall)
-from_confirmed = cancel_seats - from_waitlisted
-booking.seats -= cancel_seats
-booking.confirmed_seats -= from_confirmed
-if booking.seats == 0:
-    booking.cancelled_at = timezone.now()
-```
-Only `from_confirmed` (real capacity actually given back) triggers `F('seats_remaining') +
-from_confirmed` and waitlist promotion — cancelling only the waitlisted overflow of a `PARTIAL`
-booking frees nothing, it just turns that booking into a clean `CONFIRMED` one for what's left.
-`cancelled_at` is only set once the booking's `seats` reaches zero (fully given up); a booking
-that's been partially cancelled stays active with a smaller `seats`/`confirmed_seats`. Requesting
-to cancel more seats than the booking currently holds is rejected with `400`. `select_for_update()`
-was deliberately **not** used anywhere in this service — Django's support for it on SQLite is
-unsupported, and the conditional-`UPDATE` pattern above needed no explicit locking on either
-backend, so it also means the exact same code path is what gets tested.
-
-**Proof, not just an argument:** `bookings/tests.py::OverbookingConcurrencyTests` creates an
-event with 3 seats left, fires 10 concurrent `book` requests for 1 seat each from separate
-threads/DB connections, and asserts exactly 3 succeed (201 `CONFIRMED`), 7 are cleanly waitlisted
-(202 `WAITLISTED` — see below), and the event ends at `seats_remaining == 0` with exactly 3
-`CONFIRMED` and 7 `WAITLISTED` bookings in the DB — never more than 3 seats consumed.
+**Proof, not argument:** `bookings/tests.py::OverbookingConcurrencyTests` fires 10 concurrent
+1-seat booking requests (separate threads/DB connections) at an event with only 3 seats left, and
+asserts exactly 3 succeed, 7 are cleanly waitlisted, and `seats_remaining` ends at exactly `0`.
 
 ## Trade-offs
 
-- **SQLite instead of MySQL.** The task's fallback clause was used: Python 3.14 is very new and
-  `mysqlclient` had no prebuilt Windows wheel available, which risked a lengthy C-build detour
-  inside the 2h budget. Concurrency-wise, this trades MySQL's per-row InnoDB locking (many events
-  can be booked concurrently, only same-event bookings contend) for SQLite's single
-  writer-at-a-time database lock (booking on *any* event blocks booking on *every other* event
-  for the duration of that one `UPDATE`). Correctness — no overselling — holds on both; only
-  concurrent *throughput* differs. The models/queries have no SQLite-specific code, so switching
-  `DATABASES` to MySQL is a config change, not a rewrite (see README for what else that involves).
-- **`Booking.seats` tracks the *currently active* total, not the original request.** Supporting
-  partial cancellation by shrinking `seats` directly (rather than adding a separate
-  `original_seats`/`cancelled_seats` pair) keeps the model to three mutable counters instead of
-  four. The cost: once seats are partially cancelled, the API response no longer shows how many
-  were requested originally — only what's still active. Acceptable here since nothing else in the
-  service needs that historical number; a real audit trail would want a separate immutable field
-  or an append-only ledger of booking events instead.
-- **No `django-filter` dependency.** The event list only needed two date-range params and one
-  boolean flag, so this was implemented as plain `get_queryset()` filtering to keep the dependency
-  surface small.
-- **No self-serve registration endpoint.** JWT auth (`simplejwt`) issues tokens for existing
-  Django users; creating users is via `createsuperuser`/admin/ORM. Out of scope for the time box.
-- **No separate "organizer" role.** Any authenticated user can create events (`IsAuthenticated`
-  on `POST /events`); reads are public (`IsAuthenticatedOrReadOnly`). A real product would likely
-  gate event creation behind a staff/organizer permission.
-- **Waitlist (stretch goal, implemented).** When a booking request can't be fully satisfied
-  (`seats_remaining < requested`), instead of a flat rejection it's partially or fully waitlisted
-  on the *same* `Booking` row (`202 Accepted` if nothing was confirmed, `201 Created` if at least
-  one seat was — see "Partial fulfillment" above). This intentionally supersedes plain "reject
-  cleanly if capacity is insufficient" for the fully/partially-booked case, per the stretch goal's
-  description of the desired behavior — a request only gets a hard `409`/`400` for an unknown
-  event or invalid seat count, never merely for being full. On cancellation of a booking that held
-  seats, `_promote_waitlist()` walks other active bookings for that event that still have a
-  shortfall (`confirmed_seats < seats`), oldest first, and grants each as many of its outstanding
-  seats as are available, using the exact same atomic conditional decrement as a normal booking (so
-  promotion is subject to the same no-oversell guarantee). It **stops** as soon as one can't be
-  fully closed — the oldest booking with a shortfall gets first claim on whatever capacity exists,
-  even if that only partially fills it, and a later, smaller booking can never jump the queue ahead
-  of it. Cancelling a fully-`WAITLISTED` booking (`confirmed_seats == 0`) frees no seats and
-  doesn't trigger promotion, since it never held any.
+- **SQLite, not MySQL.** Python 3.14 is new enough that `mysqlclient` had no prebuilt Windows
+  wheel, risking a build detour inside the time box (task's stated fallback). Correctness holds on
+  both; only concurrent *throughput* differs (SQLite serializes across *all* events, MySQL only
+  per-row). No SQLite-specific code exists, so switching is a settings change (see README).
+- **`Booking.seats` tracks the currently-active total, not the original request** — supporting
+  partial cancellation by shrinking it directly avoids a 4th counter, at the cost of losing the
+  original requested count once partially cancelled.
+- **No `django-filter`, no self-serve registration, no organizer role** — each is a small,
+  deliberate scope cut for the time box, not an oversight.
+- **Waitlist (stretch goal, implemented)**, described above, intentionally replaces plain
+  rejection with waitlisting/partial-fulfillment whenever an event is full — a hard `409`/`400`
+  only occurs for an unknown event or invalid seat count.
 
 ## Scaling
 
-- **Reads to 100×:** event list/detail are read-heavy and change infrequently relative to reads,
-  so they cache well — a short-TTL cache (or a read replica) keyed by the filter params, invalidated
-  on booking/cancel for that event, removes almost all read load from the primary DB. Add indexes
-  on `start_time` and `seats_remaining` (already the only two columns filtered on). Pagination is
-  already in place so list responses stay bounded regardless of table size.
-- **Bookings to high concurrency:** the conditional-`UPDATE` pattern already scales horizontally
-  across *different* events on MySQL — row locks don't contend across rows. The remaining
-  bottleneck is many concurrent bookers on the *same* hot event, which serializes on that one row
-  no matter what; the next step there would be a per-event queue (e.g. a lightweight worker or
-  message queue serializing writes for that specific event) so clients get fast, ordered
-  accept/reject decisions instead of contending on a DB row directly, plus read replicas so the
-  booking write path isn't competing with list/detail read traffic on the same primary.
+- **Reads to 100×:** event list/detail change far less often than they're read — a short-TTL
+  cache or read replica keyed on the filter params (invalidated on booking/cancel) removes most
+  read load from the primary; add indexes on `start_time` and `seats_remaining`. Pagination is
+  already in place.
+- **Bookings to high concurrency:** the conditional-`UPDATE` pattern already scales across
+  *different* events on MySQL (row locks don't cross rows); the remaining bottleneck is many
+  bookers on the *same* hot event, which serializes on that one row regardless. Next step there:
+  a per-event queue/worker to serialize writes for that event without contending on the DB row
+  directly, plus read replicas to keep booking writes off the same primary as list/detail reads.
 
 ## AI usage note
 
-This service was built with AI assistance (Claude, via Claude Code) end to end: scaffolding the
-two Django apps, the model/serializer/view/url wiring, the concurrency test's threading harness,
-and iterating the booking/cancellation logic through three revisions (reject-on-full → waitlist
-with two rows per split booking → the current single-row `confirmed_seats` model with partial
-cancellation) as requirements were refined in conversation.
-
-I didn't accept any of the concurrency or correctness claims by inspection — each was verified by
-actually running it:
-- `OverbookingConcurrencyTests` was run repeatedly and its exact 3-succeed/7-waitlisted split and
-  final `seats_remaining == 0` invariant confirmed on each revision of the booking logic, not just
-  the first one.
-- Every behavior change (partial fulfillment, single-row split, waitlist promotion partially
-  filling the front of the queue, partial cancellation preferring the waitlisted portion first)
-  was exercised live against a running dev server with `curl`/Postman and the actual response
-  bodies inspected, not assumed — e.g. confirming a booking's `id` stays the same across a
-  `PARTIAL → CONFIRMED` promotion after a later cancellation, not just that the numbers add up.
-- One real bug surfaced and was fixed rather than worked around: the first version of the
-  concurrency test failed with sqlite3 `"database table is locked"` under Django's default
-  in-memory shared-cache test database, because `SQLITE_LOCKED` (shared-cache table lock) isn't
-  retried by the busy-timeout the way `SQLITE_BUSY` is — fixed by pointing the test database at a
-  real file (`DATABASES['default']['TEST']['NAME']`) so threads get OS-level file locking with
-  proper busy-timeout retries instead.
-- One operational mistake was mine, not the code's: I deleted the local dev `db.sqlite3` as
-  cleanup after a manual test while the user still had a server/Postman session pointed at it,
-  which surfaced as `no such table` errors for them — fixed by re-running `migrate`, and I stopped
-  deleting that file once it was clear it was in active use.
+Built with AI assistance (Claude, via Claude Code) end to end, iterating through three revisions
+of the booking/cancellation logic as requirements were refined. Nothing was accepted by
+inspection: the concurrency test was re-run after every revision to confirm the same 3-succeed/
+7-waitlisted split and `seats_remaining == 0` invariant, and every behavior change was exercised
+live against a running server with `curl`/Postman, checking actual response bodies (e.g. that a
+booking's `id` stays the same across a `PARTIAL → CONFIRMED` promotion). One real bug was found
+and fixed, not worked around: the concurrency test initially failed with sqlite3 `"database table
+is locked"` under Django's in-memory shared-cache test DB, because `SQLITE_LOCKED` isn't retried
+by the busy-timeout the way `SQLITE_BUSY` is — fixed by pointing the test DB at a real file.
